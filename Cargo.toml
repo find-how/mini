@@ -1,0 +1,70 @@
+[package]
+name = "mini"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Foundations with core features
+foundations = { version = "4.3.0", features = [
+	"cli",
+	"settings",
+	"logging",
+	"tracing",
+] }
+
+# Pingora with full feature set
+pingora = { version = "0.4", features = [
+	"proxy",  # Core proxy functionality
+	"lb",     # Load balancing
+	"cache",  # Response caching
+	"time",   # Scheduling
+	"rustls", # Pure Rust TLS (cross-platform)
+	"sentry", # Error reporting
+] }
+
+# Pingora extensions for specific functionality
+pingora-proxy = "0.4"   # Proxy specific features
+pingora-error = "0.4"   # Error types
+pingora-core = "0.4"    # Core functionality
+pingora-http = "0.4"    # HTTP types
+pingora-timeout = "0.4" # Timeout handling
+
+# tokio with async runtime
+tokio = { version = "1.39.0", features = ["full"] }
+
+# DNS server
+hickory-server = { version = "0.24", features = ["dns-over-https", "resolver"] }
+hickory-proto = "0.24"
+
+# Metrics
+prometheus = { version = "0.13", features = ["process"] }
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# Async traits
+async-trait = "0.1"
+
+# Testing dependencies
+[dev-dependencies]
+tempfile = "3.10"
+foundations = { version = "4.3.0", features = [
+	"cli",
+	"settings",
+	"logging",
+	"testing",
+	"tracing",
+] }
+tokio-test = "0.4"
+
+# [features]
+# default = ["security"] # Enable security by default on Linux
+# no-security = []       # Allow disabling security on non-Linux platforms
+
+async-trait = "0.1"
+bytes = "1.5"
+futures = "0.3"
+http = "1.0"
+log = "0.4"
+anyhow = "1.0"

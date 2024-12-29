@@ -21,11 +21,6 @@ impl DnsHandler {
         }
     }
 
-    pub fn with_tlds(mut self, tlds: Vec<&str>) -> Self {
-        self.tlds = tlds.iter().map(|s| s.to_string()).collect();
-        self
-    }
-
     fn is_supported_domain(&self, name: &Name) -> bool {
         if let Some(tld) = name.iter().last() {
             if let Ok(tld_str) = std::str::from_utf8(tld) {

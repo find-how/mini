@@ -1,99 +1,96 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
-use anyhow::{anyhow, Result};
+use std::sync::Arc;
+use anyhow::Result;
+use tokio::sync::RwLock;
 
-#[derive(Clone, Debug)]
+use crate::registry::DriverRegistry;
+
+/// Represents a site configuration.
+/// Currently only used for testing, but will be expanded in the future
+/// to support more site-specific configuration.
+#[derive(Clone)]
 pub struct Site {
-    pub path: PathBuf,
-    pub secure: bool,
-    pub php_version: Option<String>,
+    domain: String,
+    path: PathBuf,
+    secure: bool,
 }
 
 impl Site {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(domain: String, path: PathBuf) -> Self {
         Site {
+            domain,
             path,
             secure: false,
-            php_version: None,
         }
+    }
+
+    pub fn secure(&mut self) {
+        self.secure = true;
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn is_secure(&self) -> bool {
+        self.secure
     }
 }
 
+/// Manages site configurations and their associated drivers.
+/// The registry field is currently unused but will be used in the future
+/// to manage site drivers.
 pub struct SiteManager {
-    sites: RwLock<HashMap<String, Site>>,
-    paths: RwLock<Vec<PathBuf>>,
+    sites: Arc<RwLock<HashMap<String, Site>>>,
+    registry: Arc<DriverRegistry>,
 }
 
 impl SiteManager {
-    pub fn new() -> Self {
+    pub fn new(registry: Arc<DriverRegistry>) -> Self {
         SiteManager {
-            sites: RwLock::new(HashMap::new()),
-            paths: RwLock::new(Vec::new()),
+            sites: Arc::new(RwLock::new(HashMap::new())),
+            registry,
         }
     }
 
-    pub fn park_path(&self, path: PathBuf) -> Result<()> {
-        let mut paths = self.paths.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
+    pub async fn add_site(&self, domain: &str, path: PathBuf) -> Result<()> {
+        let mut sites = self.sites.write().await;
+        sites.insert(domain.to_string(), Site::new(domain.to_string(), path));
         Ok(())
     }
 
-    pub fn unpark_path(&self, path: &PathBuf) -> Result<()> {
-        let mut paths = self.paths.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
-        if let Some(pos) = paths.iter().position(|p| p == path) {
-            paths.remove(pos);
+    pub async fn secure_site(&self, domain: &str) -> Result<()> {
+        let mut sites = self.sites.write().await;
+        if let Some(site) = sites.get_mut(domain) {
+            site.secure();
             Ok(())
         } else {
-            Err(anyhow!("Path not found"))
+            anyhow::bail!("Site not found")
         }
     }
 
-    pub fn add_site(&self, domain: &str, site: Site) -> Result<()> {
-        let mut sites = self.sites.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
-        sites.insert(domain.to_string(), site);
-        Ok(())
+    pub async fn get_site(&self, domain: &str) -> Option<Site> {
+        let sites = self.sites.read().await;
+        sites.get(domain).cloned()
     }
 
-    pub fn remove_site(&self, domain: &str) -> Result<()> {
-        let mut sites = self.sites.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
-        sites.remove(domain);
-        Ok(())
-    }
-
-    pub fn get_site(&self, domain: &str) -> Option<Site> {
-        self.sites.read().ok()?.get(domain).cloned()
-    }
-
-    pub fn secure_site(&self, domain: &str) -> Result<()> {
-        let mut sites = self.sites.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
-        if let Some(site) = sites.get_mut(domain) {
-            site.secure = true;
-            Ok(())
+    pub async fn start_site(&self, domain: &str) -> Result<()> {
+        let sites = self.sites.read().await;
+        if let Some(site) = sites.get(domain) {
+            // Try to find a driver that supports this site
+            if let Some(driver) = self.registry.get("Laravel") {
+                if driver.supports(site.path()) {
+                    return driver.start().await;
+                }
+            }
+            anyhow::bail!("No suitable driver found for site")
         } else {
-            Err(anyhow!("Site not found"))
-        }
-    }
-
-    pub fn unsecure_site(&self, domain: &str) -> Result<()> {
-        let mut sites = self.sites.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
-        if let Some(site) = sites.get_mut(domain) {
-            site.secure = false;
-            Ok(())
-        } else {
-            Err(anyhow!("Site not found"))
-        }
-    }
-
-    pub fn set_php_version(&self, domain: &str, version: String) -> Result<()> {
-        let mut sites = self.sites.write().map_err(|_| anyhow!("Failed to acquire write lock"))?;
-        if let Some(site) = sites.get_mut(domain) {
-            site.php_version = if version.is_empty() { None } else { Some(version) };
-            Ok(())
-        } else {
-            Err(anyhow!("Site not found"))
+            anyhow::bail!("Site not found")
         }
     }
 }
@@ -103,57 +100,45 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::fs;
+    use crate::driver::LaravelDriver;
 
     #[tokio::test]
     async fn test_site_manager() {
+        let registry = Arc::new(DriverRegistry::new());
+        let manager = SiteManager::new(registry.clone());
+
         let temp_dir = TempDir::new().unwrap();
-        let root = temp_dir.path();
+        let site_path = temp_dir.path().to_path_buf();
 
-        // Create test site paths
-        let site1_path = root.join("site1");
-        let site2_path = root.join("site2");
-        fs::create_dir_all(&site1_path).await.unwrap();
-        fs::create_dir_all(&site2_path).await.unwrap();
+        // Create Laravel site structure
+        fs::create_dir_all(site_path.join("public")).await.unwrap();
+        fs::write(site_path.join("artisan"), "").await.unwrap();
+        fs::write(site_path.join("public/index.php"), "").await.unwrap();
 
-        let manager = SiteManager::new();
+        // Register Laravel driver
+        registry.register(Arc::new(LaravelDriver::new(
+            site_path.clone(),
+            "8.2".to_string(),
+        )));
 
-        // Test parking paths
-        manager.park_path(site1_path.clone()).unwrap();
-        manager.park_path(site2_path.clone()).unwrap();
+        // Test adding a site
+        manager.add_site("example.test", site_path.clone()).await.unwrap();
 
-        // Test adding sites
-        let site1 = Site::new(site1_path.clone());
-        let site2 = Site::new(site2_path.clone());
-        manager.add_site("site1.test", site1).unwrap();
-        manager.add_site("site2.test", site2).unwrap();
+        // Test getting a site
+        let site = manager.get_site("example.test").await.unwrap();
+        assert_eq!(site.domain(), "example.test");
+        assert_eq!(site.path(), &site_path);
+        assert!(!site.is_secure());
 
-        // Test getting sites
-        let retrieved_site1 = manager.get_site("site1.test").unwrap();
-        assert_eq!(retrieved_site1.path, site1_path);
-        assert!(!retrieved_site1.secure);
-        assert_eq!(retrieved_site1.php_version, None);
+        // Test securing a site
+        manager.secure_site("example.test").await.unwrap();
+        let site = manager.get_site("example.test").await.unwrap();
+        assert!(site.is_secure());
 
-        // Test securing site
-        manager.secure_site("site1.test").unwrap();
-        let secured_site = manager.get_site("site1.test").unwrap();
-        assert!(secured_site.secure);
+        // Test starting a site
+        assert!(manager.start_site("example.test").await.is_ok());
 
-        // Test setting PHP version
-        manager.set_php_version("site1.test", "8.2".to_string()).unwrap();
-        let php_site = manager.get_site("site1.test").unwrap();
-        assert_eq!(php_site.php_version, Some("8.2".to_string()));
-
-        // Test clearing PHP version
-        manager.set_php_version("site1.test", String::new()).unwrap();
-        let cleared_site = manager.get_site("site1.test").unwrap();
-        assert_eq!(cleared_site.php_version, None);
-
-        // Test removing sites
-        manager.remove_site("site1.test").unwrap();
-        assert!(manager.get_site("site1.test").is_none());
-
-        // Test unparking paths
-        manager.unpark_path(&site1_path).unwrap();
-        assert!(manager.unpark_path(&site1_path).is_err());
+        // Test getting a non-existent site
+        assert!(manager.get_site("nonexistent.test").await.is_none());
     }
 }

@@ -4,10 +4,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::path::PathBuf;
 use log::{debug, error, info, warn};
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo, Protocol};
-use hickory_server::authority::{MessageResponse, MessageResponseBuilder};
 use prometheus::{register_int_counter, register_int_gauge};
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -18,7 +14,6 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use tokio::net::UdpSocket;
 use async_trait::async_trait;
-use std::io;
 
 mod driver;
 mod registry;
@@ -33,8 +28,6 @@ use crate::site::SiteManager;
 pub struct MyProxy {
     req_metric: prometheus::IntCounter,
     active_connections: prometheus::IntGauge,
-    dns_server: Arc<Server>,
-    site_manager: Arc<SiteManager>,
 }
 
 #[async_trait]
@@ -155,21 +148,19 @@ async fn main() -> Result<()> {
     server.bootstrap();
 
     // Initialize site manager and driver registry
-    let mut registry = DriverRegistry::new();
-    let site_manager = Arc::new(SiteManager::new());
+    let registry = Arc::new(DriverRegistry::new());
+    let _site_manager = Arc::new(SiteManager::new(registry.clone()));
 
     // Register Laravel driver with default PHP version
     registry.register(Arc::new(LaravelDriver::new(
-        PathBuf::from("/"),  // Base path will be set per site
-        "8.2".to_string(),   // Default PHP version
+        PathBuf::from("/path/to/app"),
+        "8.2".to_string(),
     )));
 
     // Setup proxy service
     let proxy = MyProxy {
         req_metric: register_int_counter!("req_counter", "Number of requests").unwrap(),
         active_connections: register_int_gauge!("active_connections", "Number of active connections").unwrap(),
-        dns_server: Arc::new(Server::new(None).unwrap()),
-        site_manager: site_manager.clone(),
     };
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
@@ -223,7 +214,7 @@ async fn main() -> Result<()> {
     });
 
     let dns_future = tokio::spawn(async move {
-        dns_server.block_until_done().await;
+        let _ = dns_server.block_until_done().await;
         info!("DNS server stopped");
     });
 

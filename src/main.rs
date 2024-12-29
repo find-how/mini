@@ -14,16 +14,26 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use prometheus::{register_int_counter, register_int_gauge};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use std::sync::Arc;
+
+mod driver;
+mod registry;
+mod site;
+
+use crate::driver::LaravelDriver;
+use crate::registry::DriverRegistry;
+use crate::site::SiteManager;
 
 // Proxy implementation
 pub struct MyProxy {
     req_metric: prometheus::IntCounter,
     active_connections: prometheus::IntGauge,
     dns_server: Arc<Server>,
+    site_manager: Arc<SiteManager>,
 }
 
 #[async_trait]
@@ -226,17 +236,28 @@ async fn main() -> Result<()> {
     let mut server = Server::new(Some(Opt::default())).unwrap();
     server.bootstrap();
 
+    // Initialize site manager and driver registry
+    let mut registry = DriverRegistry::new();
+    let site_manager = Arc::new(SiteManager::new());
+
+    // Register Laravel driver with default PHP version
+    registry.register(Arc::new(LaravelDriver::new(
+        PathBuf::from("/"),  // Base path will be set per site
+        "8.2".to_string(),   // Default PHP version
+    )));
+
     // Setup proxy service
     let proxy = MyProxy {
         req_metric: register_int_counter!("req_counter", "Number of requests").unwrap(),
         active_connections: register_int_gauge!("active_connections", "Number of active connections").unwrap(),
         dns_server: Arc::new(Server::new(None).unwrap()),
+        site_manager: site_manager.clone(),
     };
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
     // Add plain HTTP listener
-    proxy_service.add_tcp("0.0.0.0:8080");
+    proxy_service.add_tcp("0.0.0.0:80");
 
     // Add HTTPS listener with TLS
     let cert_path = "certs/server.crt";
@@ -244,7 +265,7 @@ async fn main() -> Result<()> {
     if std::path::Path::new(cert_path).exists() && std::path::Path::new(key_path).exists() {
         let mut tls_settings = TlsSettings::intermediate(cert_path, key_path).unwrap();
         tls_settings.enable_h2();
-        proxy_service.add_tls_with_settings("0.0.0.0:8443", None, tls_settings);
+        proxy_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
     } else {
         warn!("TLS certificates not found, HTTPS listener disabled");
     }
@@ -299,9 +320,27 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingora_http::RequestHeader;
-    use tokio_test::io::Builder;
+    use pingora_http::Method;
     use std::sync::Arc;
+    use tempfile::TempDir;
+    use std::path::PathBuf;
+    use tokio_test::io::{Builder, Mock};
+
+    struct TestContext {
+        _temp_dir: TempDir,
+        site_path: PathBuf,
+    }
+
+    impl TestContext {
+        fn new() -> Self {
+            let temp_dir = TempDir::new().unwrap();
+            let site_path = temp_dir.path().to_path_buf();
+            TestContext {
+                _temp_dir: temp_dir,
+                site_path,
+            }
+        }
+    }
 
     async fn setup_test_proxy(test_name: &str) -> MyProxy {
         MyProxy {
@@ -314,32 +353,39 @@ mod tests {
                 &format!("Test active connections for {}", test_name)
             ).unwrap(),
             dns_server: Arc::new(Server::new(None).unwrap()),
+            site_manager: Arc::new(SiteManager::new()),
         }
     }
 
     #[tokio::test]
     async fn test_proxy_initialization() {
         let proxy = setup_test_proxy("init").await;
-        let _ctx = proxy.new_ctx();
+        let ctx = proxy.new_ctx();
+        assert!(ctx == (), "Context should be empty unit type");
     }
 
     #[tokio::test]
     async fn test_proxy_upstream_peer() -> Result<()> {
         let proxy = setup_test_proxy("peer").await;
-        let _session = Session::new_h1(Box::new(Builder::new().build()));
-        let _ctx = proxy.new_ctx();
 
-        // Create a peer directly to test the configuration
-        let peer = Box::new(HttpPeer::new(
-            ("1.1.1.1", 443),
-            true,
-            "example.com".to_string(),
-        ));
+        // Create a mock request
+        let request = b"GET / HTTP/1.1\r\nHost: test.test\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(request)  // What we'll read
+            .write(&[])     // We don't expect any writes in this test
+            .build();
 
+        let mut session = Session::new_h1(Box::new(mock_io));
+        session.read_request().await?;
+
+        let mut ctx = proxy.new_ctx();
+
+        // Test with custom host
+        let peer = proxy.upstream_peer(&mut session, &mut ctx).await?;
         assert_eq!(peer.address().to_string().split(':').nth(1).unwrap(), "443");
-        assert_eq!(peer.options.connection_timeout, None);
-        assert_eq!(peer.options.read_timeout, None);
-        assert_eq!(peer.options.write_timeout, None);
+        assert_eq!(peer.options.connection_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(30)));
 
         Ok(())
     }
@@ -349,7 +395,7 @@ mod tests {
         let proxy = setup_test_proxy("filter").await;
         let mut session = Session::new_h1(Box::new(Builder::new().build()));
         let mut ctx = proxy.new_ctx();
-        let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+        let mut request = RequestHeader::build(Method::GET, b"/", None).unwrap();
 
         proxy.upstream_request_filter(&mut session, &mut request, &mut ctx).await?;
 
@@ -357,6 +403,48 @@ mod tests {
             request.headers.get("x-forwarded-by").unwrap(),
             "MyProxy"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_proxy_response_filter() -> Result<()> {
+        let proxy = setup_test_proxy("response").await;
+        let mut session = Session::new_h1(Box::new(Builder::new().build()));
+        let mut ctx = proxy.new_ctx();
+        let mut response = ResponseHeader::build(200, None).unwrap();
+
+        proxy.response_filter(&mut session, &mut response, &mut ctx).await?;
+
+        assert_eq!(
+            response.headers.get("server").unwrap(),
+            "MyProxy"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_http_version_support() -> Result<()> {
+        let proxy = setup_test_proxy("http_version").await;
+
+        // Test HTTP/1.1 request
+        let http1_request = b"GET / HTTP/1.1\r\nHost: test.test\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(http1_request)
+            .write(&[])
+            .build();
+
+        let mut session = Session::new_h1(Box::new(mock_io));
+        session.read_request().await?;
+
+        let mut ctx = proxy.new_ctx();
+        let peer = proxy.upstream_peer(&mut session, &mut ctx).await?;
+
+        // Verify HTTP/1.1 support
+        assert_eq!(peer.address().to_string().split(':').nth(1).unwrap(), "443");
+        assert_eq!(peer.options.connection_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(30)));
+
         Ok(())
     }
 }

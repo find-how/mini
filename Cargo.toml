@@ -50,6 +50,14 @@ anyhow = "1.0"
 # File system
 tempfile = "3.8"
 
+# HTTP
+http = "0.2"
+hyper = { version = "0.14", features = ["full"] }
+mime_guess = "2.0"
+
+# Global state
+lazy_static = "1.4"
+
 # Testing dependencies
 [dev-dependencies]
 foundations = { version = "4.3.0", features = [
@@ -60,7 +68,9 @@ foundations = { version = "4.3.0", features = [
 	"tracing",
 ] }
 tokio-test = "0.4"
-
 bytes = "1.5"
 futures = "0.3"
-http = "1.0"
+tempfile = "3.8"
+pretty_assertions = "1.4"
+test-log = { version = "0.2", features = ["trace"] }
+env_logger = "0.11"

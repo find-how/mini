@@ -12,25 +12,16 @@ foundations = { version = "4.3.0", features = [
 	"tracing",
 ] }
 
-# Pingora with full feature set
-pingora = { version = "0.4", features = [
-	"proxy",  # Core proxy functionality
-	"lb",     # Load balancing
-	"cache",  # Response caching
-	"time",   # Scheduling
-	"rustls", # Pure Rust TLS (cross-platform)
-	"sentry", # Error reporting
-] }
-
-# Pingora extensions for specific functionality
-pingora-proxy = "0.4"   # Proxy specific features
-pingora-error = "0.4"   # Error types
-pingora-core = "0.4"    # Core functionality
-pingora-http = "0.4"    # HTTP types
-pingora-timeout = "0.4" # Timeout handling
+# Pingora dependencies - all aligned to 0.4
+pingora = { version = "0.4", features = ["proxy"] }
+pingora-proxy = "0.4"                               # Proxy specific features
+pingora-error = "0.4"                               # Error types
+pingora-core = "0.4"                                # Core functionality
+pingora-http = "0.4"                                # HTTP types
+pingora-timeout = "0.4"                             # Timeout handling
 
 # tokio with async runtime
-tokio = { version = "1.39.0", features = ["full"] }
+tokio = { version = "1.0", features = ["full"] }
 
 # DNS server
 hickory-server = { version = "0.24", features = ["dns-over-https", "resolver"] }
@@ -48,7 +39,7 @@ async-trait = "0.1"
 
 # Testing dependencies
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.8"
 foundations = { version = "4.3.0", features = [
 	"cli",
 	"settings",
@@ -68,3 +59,7 @@ futures = "0.3"
 http = "1.0"
 log = "0.4"
 anyhow = "1.0"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+num_cpus = "1.16"

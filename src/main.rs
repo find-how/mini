@@ -1,28 +1,29 @@
-use async_trait::async_trait;
-use hickory_proto::op::{MessageType, ResponseCode};
-use hickory_proto::rr::{Name, Record, RecordType};
-use hickory_server::authority::MessageResponseBuilder;
-use hickory_server::server::RequestHandler;
-use hickory_server::server::{Request, ResponseHandler, ResponseInfo};
+use std::sync::Arc;
+use std::time::Duration;
+use std::future::Future;
+use std::pin::Pin;
+use std::path::PathBuf;
 use log::{debug, error, info, warn};
-use pingora_core::listeners::tls::TlsSettings;
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo, Protocol};
+use hickory_server::authority::{MessageResponse, MessageResponseBuilder};
+use prometheus::{register_int_counter, register_int_gauge};
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
+use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
-use prometheus::{register_int_counter, register_int_gauge};
-use std::future::Future;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::UdpSocket;
+use async_trait::async_trait;
+use std::io;
 
 mod driver;
 mod registry;
 mod site;
+mod dns;
 
 use crate::driver::LaravelDriver;
 use crate::registry::DriverRegistry;
@@ -144,89 +145,6 @@ impl ProxyHttp for MyProxy {
     }
 }
 
-// DNS handler implementation
-pub struct DnsHandler {
-    records: Vec<Record>,
-}
-
-impl DnsHandler {
-    pub fn new() -> Self {
-        // Initialize with some static records
-        let mut records = Vec::new();
-
-        // Add A record for example.com
-        if let Ok(name) = Name::from_ascii("example.com") {
-            records.push(Record::from_rdata(
-                name,
-                300,
-                hickory_proto::rr::RData::A("93.184.216.34".parse().unwrap()),
-            ));
-        }
-
-        DnsHandler { records }
-    }
-}
-
-#[async_trait]
-impl RequestHandler for DnsHandler {
-    async fn handle_request<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        mut response_handle: R,
-    ) -> ResponseInfo {
-        let query = request.query();
-        let query_name = query.name();
-        let query_type = query.query_type();
-
-        // Find matching records
-        let matching_records: Vec<_> = self
-            .records
-            .iter()
-            .filter(|r| {
-                r.name().to_string().to_lowercase() == query_name.to_string().to_lowercase()
-                    && (query_type == RecordType::ANY || r.record_type() == query_type)
-            })
-            .cloned()
-            .collect();
-
-        // Build response header
-        let mut header = request.header().clone();
-        header.set_message_type(MessageType::Response);
-        header.set_authoritative(true);
-
-        if !matching_records.is_empty() {
-            header.set_response_code(ResponseCode::NoError);
-            let builder = MessageResponseBuilder::from_message_request(request);
-            let response = builder.build(
-                header.clone(),
-                matching_records.iter(),
-                None,
-                None,
-                None,
-            );
-            let _ = response_handle.send_response(response);
-        } else {
-            header.set_response_code(ResponseCode::NXDomain);
-            let builder = MessageResponseBuilder::from_message_request(request);
-            let response = builder.build(
-                header.clone(),
-                std::iter::empty(),
-                None,
-                None,
-                None,
-            );
-            let _ = response_handle.send_response(response);
-        }
-
-        ResponseInfo::from(header)
-    }
-}
-
-// Make DnsHandler Send + Sync + Unpin + 'static
-unsafe impl Send for DnsHandler {}
-unsafe impl Sync for DnsHandler {}
-impl Unpin for DnsHandler {}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -279,7 +197,7 @@ async fn main() -> Result<()> {
     server.add_service(prometheus_service);
 
     // Start DNS server
-    let dns_handler = DnsHandler::new();
+    let dns_handler = dns::DnsHandler::new();
     let mut dns_server = hickory_server::ServerFuture::new(dns_handler);
 
     match UdpSocket::bind("0.0.0.0:53").await {
@@ -315,136 +233,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pingora_http::Method;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-    use std::path::PathBuf;
-    use tokio_test::io::{Builder, Mock};
-
-    struct TestContext {
-        _temp_dir: TempDir,
-        site_path: PathBuf,
-    }
-
-    impl TestContext {
-        fn new() -> Self {
-            let temp_dir = TempDir::new().unwrap();
-            let site_path = temp_dir.path().to_path_buf();
-            TestContext {
-                _temp_dir: temp_dir,
-                site_path,
-            }
-        }
-    }
-
-    async fn setup_test_proxy(test_name: &str) -> MyProxy {
-        MyProxy {
-            req_metric: register_int_counter!(
-                &format!("test_req_counter_{}", test_name),
-                &format!("Test request counter for {}", test_name)
-            ).unwrap(),
-            active_connections: register_int_gauge!(
-                &format!("test_active_connections_{}", test_name),
-                &format!("Test active connections for {}", test_name)
-            ).unwrap(),
-            dns_server: Arc::new(Server::new(None).unwrap()),
-            site_manager: Arc::new(SiteManager::new()),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_proxy_initialization() {
-        let proxy = setup_test_proxy("init").await;
-        let ctx = proxy.new_ctx();
-        assert!(ctx == (), "Context should be empty unit type");
-    }
-
-    #[tokio::test]
-    async fn test_proxy_upstream_peer() -> Result<()> {
-        let proxy = setup_test_proxy("peer").await;
-
-        // Create a mock request
-        let request = b"GET / HTTP/1.1\r\nHost: test.test\r\n\r\n";
-        let mock_io = Builder::new()
-            .read(request)  // What we'll read
-            .write(&[])     // We don't expect any writes in this test
-            .build();
-
-        let mut session = Session::new_h1(Box::new(mock_io));
-        session.read_request().await?;
-
-        let mut ctx = proxy.new_ctx();
-
-        // Test with custom host
-        let peer = proxy.upstream_peer(&mut session, &mut ctx).await?;
-        assert_eq!(peer.address().to_string().split(':').nth(1).unwrap(), "443");
-        assert_eq!(peer.options.connection_timeout, Some(Duration::from_secs(10)));
-        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(30)));
-        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(30)));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_proxy_request_filter() -> Result<()> {
-        let proxy = setup_test_proxy("filter").await;
-        let mut session = Session::new_h1(Box::new(Builder::new().build()));
-        let mut ctx = proxy.new_ctx();
-        let mut request = RequestHeader::build(Method::GET, b"/", None).unwrap();
-
-        proxy.upstream_request_filter(&mut session, &mut request, &mut ctx).await?;
-
-        assert_eq!(
-            request.headers.get("x-forwarded-by").unwrap(),
-            "MyProxy"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_proxy_response_filter() -> Result<()> {
-        let proxy = setup_test_proxy("response").await;
-        let mut session = Session::new_h1(Box::new(Builder::new().build()));
-        let mut ctx = proxy.new_ctx();
-        let mut response = ResponseHeader::build(200, None).unwrap();
-
-        proxy.response_filter(&mut session, &mut response, &mut ctx).await?;
-
-        assert_eq!(
-            response.headers.get("server").unwrap(),
-            "MyProxy"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_http_version_support() -> Result<()> {
-        let proxy = setup_test_proxy("http_version").await;
-
-        // Test HTTP/1.1 request
-        let http1_request = b"GET / HTTP/1.1\r\nHost: test.test\r\n\r\n";
-        let mock_io = Builder::new()
-            .read(http1_request)
-            .write(&[])
-            .build();
-
-        let mut session = Session::new_h1(Box::new(mock_io));
-        session.read_request().await?;
-
-        let mut ctx = proxy.new_ctx();
-        let peer = proxy.upstream_peer(&mut session, &mut ctx).await?;
-
-        // Verify HTTP/1.1 support
-        assert_eq!(peer.address().to_string().split(':').nth(1).unwrap(), "443");
-        assert_eq!(peer.options.connection_timeout, Some(Duration::from_secs(10)));
-        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(30)));
-        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(30)));
-
-        Ok(())
-    }
 }

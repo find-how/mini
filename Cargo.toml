@@ -21,7 +21,7 @@ pingora-http = "0.4"                                # HTTP types
 pingora-timeout = "0.4"                             # Timeout handling
 
 # tokio with async runtime
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["full", "test-util"] }
 
 # DNS server
 hickory-server = { version = "0.24", features = ["dns-over-https", "resolver"] }
@@ -37,9 +37,21 @@ log = "0.4"
 # Async traits
 async-trait = "0.1"
 
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# System info
+num_cpus = "1.16"
+
+# Error handling
+anyhow = "1.0"
+
+# File system
+tempfile = "3.8"
+
 # Testing dependencies
 [dev-dependencies]
-tempfile = "3.8"
 foundations = { version = "4.3.0", features = [
 	"cli",
 	"settings",
@@ -49,17 +61,6 @@ foundations = { version = "4.3.0", features = [
 ] }
 tokio-test = "0.4"
 
-# [features]
-# default = ["security"] # Enable security by default on Linux
-# no-security = []       # Allow disabling security on non-Linux platforms
-
-async-trait = "0.1"
 bytes = "1.5"
 futures = "0.3"
 http = "1.0"
-log = "0.4"
-anyhow = "1.0"
-
-serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
-num_cpus = "1.16"
